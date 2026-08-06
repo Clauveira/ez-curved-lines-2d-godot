@@ -934,10 +934,10 @@ func _update_assigned_nodes_with_clips(polygon_points : PackedVector2Array, vali
 		navigation_region.navigation_polygon = navigation_poly
 
 
-## Determines which polygons the [CollisionPolygon2D] nodes of the
-## [member collision_object] should cover, based on [member collision_mode].
-## [param fill_polygons] holds the (clipped) fill area of this shape, the stroke area
-## is read from [member cached_poly_strokes], which is empty when no stroke is assigned
+# Determines which polygons the CollisionPolygon2D nodes of the collision_object
+# should cover, based on collision_mode.
+# The fill_polygons hold the (clipped) fill area of this shape, the stroke area is
+# read from cached_poly_strokes, which is empty when no stroke is assigned
 func _get_collision_polygons(fill_polygons : Array[PackedVector2Array]) -> Array[PackedVector2Array]:
 	match collision_mode:
 		CollisionMode.FILL_ONLY:
@@ -960,10 +960,10 @@ func _get_fill_and_stroke_polygons(fill_polygons : Array[PackedVector2Array]) ->
 	return result
 
 
-## Assigns [param collision_polygons] to the [CollisionPolygon2D] nodes of the
-## [member collision_object], reusing the existing ones and creating new ones when
-## needed. Any surplus node is kept, but hidden and disabled, so it can be reused
-## when the amount of polygons grows again
+# Assigns the collision_polygons to the CollisionPolygon2D nodes of the
+# collision_object, reusing the existing ones and creating new ones when needed.
+# Any surplus node is kept, but hidden and disabled, so it can be reused when the
+# amount of polygons grows again
 func _update_collision_polygons(collision_polygons : Array[PackedVector2Array]) -> void:
 	var existing = collision_object.get_children().filter(func(ch): return ch is CollisionPolygon2D)
 	for idx in existing.size():
