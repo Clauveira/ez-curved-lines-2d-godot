@@ -1,16 +1,21 @@
 # Changelog
 
-## Unreleased
+## 2.29.0
+
+⚠️ Small notice: a shape with a stroke used to generate a `CollisionPolygon2D` for its fill _and_ one for each piece of its stroke, which overlapped each other. Those are now merged into one single collider covering the exact same area. Nothing has to be changed in your scenes, but the amount of `CollisionPolygon2D` nodes under your collision objects will go down.
 
 ### Added
 
 - A `collision_mode` property on `ScalableVectorShape2D`, which controls what the `CollisionPolygon2D` nodes of the assigned `collision_object` cover:
-  - `Fill And Stroke` (default): one collider for the fill and one for each piece of the stroke, as before
-  - `Merged`: the fill and the stroke as one single area, so a shape with a stroke no longer generates a collider for the fill _and_ an overlapping one for the stroke - cutouts made with clip paths are preserved
+  - `Merged` (default): the fill and the stroke as one single area
   - `Fill Only` / `Stroke Only`: only one of both areas
 - `Geometry2DUtil.union_polygons`: merges a set of overlapping polygons into the smallest set of polygons covering the same area, slicing the result around any enclosed area, because a `CollisionPolygon2D` cannot represent a hole
 
-## 2.28.1
+### Changed
+
+- The fill and the stroke of a shape now share one single collider, in stead of generating one collider each which overlap where the stroke covers the fill. Cutouts made with clip paths are preserved.
+
+## 2.28.2
 
 ### Added
 
@@ -19,6 +24,7 @@
 ### Changed
 
 - Bugfix: setting `DynamicOutline2D.merge_shapes` now queues a redraw
+- Bugfix: pressing alt after undo subdivision now places the crosshair on the correct line
 
 ## 2.27.7
 
