@@ -13,9 +13,9 @@ extends SceneTree
 # The scene is a fixture rather than a unit: if it is not in the project the suite says
 # so and passes, rather than failing for a reason that has nothing to do with the code.
 
-const SCENE_PATH := "res://topology_bug2.tscn"
+const SCENE_PATH := "res://collision_matrix.tscn"
 const REVOLUTIONS := 3.0
-const STEPS := 64
+const STEPS := 192
 const MAX_RADIUS := 80.0
 
 const EXTRUSION_NAMES := ["MIDDLE", "OUTWARD", "INWARD"]
@@ -37,8 +37,26 @@ func configuration_of(svs) -> String:
 			MODE_NAMES[svs.collision_mode]]
 
 
-# What the editor would fail to draw in this one shape, if anything.
+# What would fail to draw in this one shape, if anything - collider or fill.
+#
+# The fill matters as much as the collider and fails independently: a Polygon2D renders
+# in a running game, not just in the editor, so an outline the triangulator refuses is a
+# hole in the shape wherever it is used.
 func undrawable(svs) -> String:
+	if is_instance_valid(svs.polygon):
+		var points : PackedVector2Array = svs.polygon.polygon
+		if points.size() > 2:
+			if svs.polygon.polygons.is_empty():
+				if Geometry2D.triangulate_polygon(points).is_empty():
+					return "fill of %d pts cannot be triangulated" % points.size()
+			else:
+				for ranges in svs.polygon.polygons:
+					var sub : PackedVector2Array = []
+					for index in ranges:
+						if index < points.size():
+							sub.append(points[index])
+					if sub.size() > 2 and Geometry2D.triangulate_polygon(sub).is_empty():
+						return "fill piece of %d pts cannot be triangulated" % sub.size()
 	if not is_instance_valid(svs.collision_object):
 		return ""
 	for collider in svs.collision_object.get_children():

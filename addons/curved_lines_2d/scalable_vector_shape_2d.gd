@@ -1121,8 +1121,19 @@ func _append_collidable(loop : PackedVector2Array, usable : Array[PackedVector2A
 	var subject := _partitionable(loop)
 	var pieces := Geometry2D.decompose_polygon_in_convex(subject)
 	if pieces.is_empty():
-		usable.append(subject)
-		return
+		# the partitioner refused it outright, which it does for shapes the silent test
+		# above cannot always predict. Clipper rebuilding the outline usually settles
+		# whatever it objected to; if it does not, the geometry is handed on as it is,
+		# because a collider that logs is a smaller problem than a missing one
+		for rebuilt in Geometry2DUtil.normalize_contour(subject):
+			var retry := Geometry2D.decompose_polygon_in_convex(rebuilt)
+			if not retry.is_empty():
+				subject = rebuilt
+				pieces = retry
+				break
+		if pieces.is_empty():
+			usable.append(subject)
+			return
 	var degenerate := false
 	for piece in pieces:
 		if Geometry2D.triangulate_polygon(piece).is_empty():
