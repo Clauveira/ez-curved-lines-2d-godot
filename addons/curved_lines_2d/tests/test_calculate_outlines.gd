@@ -73,7 +73,7 @@ func test_cutout_keeps_its_own_contour() -> void:
 			"%.0f vs %.0f" % [area(contours[1]), expected])
 
 
-# A C-shaped cutout leaves a peninsula of fill sticking into it. slice_polygon_vertical()
+# A C-shaped cutout leaves a peninsula of fill sticking into it. slice_polygon_through()
 # cuts straight through the neck connecting it, so the fill arrives here as three
 # polygons of which two only touch along that cut. Merging a _pair_ of them reports the
 # hole of that pair, which still counts the peninsula as part of the cutout: reading the

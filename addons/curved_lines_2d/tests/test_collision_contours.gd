@@ -138,10 +138,18 @@ func test_contours_without_surface_get_no_collider() -> void:
 	var contours : Array[PackedVector2Array] = [square, collinear, pinched,
 			from_a_saved_scene]
 	var usable := shape._collidable_contours(contours)
-	check("the two contours with surface survive", usable.size() == 2,
-			"%d of %d kept" % [usable.size(), contours.size()])
+	# what matters is that nothing without surface reaches a node and nothing with
+	# surface is lost - not how many contours come back, which is the gate's business
+	check("something survives", not usable.is_empty(), "%d contours" % usable.size())
 	check("the collinear triangle is dropped", not usable.has(collinear))
 	check("the pinched contour is dropped", not usable.has(pinched))
+	var kept_surface := 0.0
+	for contour in usable:
+		kept_surface += Geometry2DUtil.get_polygon_area(contour)
+	check("the surface of both real contours is kept",
+			is_equal_approx(snappedf(kept_surface, 0.1),
+					snappedf(10000.0 + Geometry2DUtil.get_polygon_area(from_a_saved_scene), 0.1)),
+			"%.1f covered" % kept_surface)
 	for contour in usable:
 		check("what is kept triangulates: %d pts" % contour.size(),
 				not Geometry2D.triangulate_polygon(contour).is_empty())

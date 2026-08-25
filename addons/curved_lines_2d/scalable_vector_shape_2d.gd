@@ -83,16 +83,10 @@ enum StrokeExtrusionDirection {
 	INWARD
 }
 
-## The surface below which a contour is not worth a [CollisionPolygon2D]: at this scale
-## it is an artefact of a boolean operation rather than a piece of shape. A collider
-## covering less than a pixel collides with nothing, and its convex partition is all
-## but guaranteed to contain a piece with no surface at all - which the editor cannot
-## fill, and reports as `Invalid polygon data, triangulation failed.` on every redraw.
-## [br][br]
-## It has to be a whole pixel rather than a fraction of one, because the same figure
-## decides which pieces of a partition are worth keeping: a contour of a tenth of a
-## pixel clears a tenth-of-a-pixel bar, then splits into pieces that all fall under it,
-## leaving nothing to keep and nothing to do but hand the bad contour on.
+## The surface below which a contour is not worth a [CollisionPolygon2D]. A collider
+## covering less than a pixel collides with nothing, and its convex partition is all but
+## guaranteed to contain a piece with no surface for the editor to fill - which it
+## reports as `Invalid polygon data, triangulation failed.` on every redraw.
 const MINIMUM_COLLISION_AREA := 1.0
 
 
@@ -1100,10 +1094,9 @@ func _collidable_contours(contours : Array[PackedVector2Array]) -> Array[PackedV
 				if Geometry2DUtil.get_polygon_area(raw_loop) <= MINIMUM_COLLISION_AREA:
 					continue
 				if Geometry2D.triangulate_polygon(raw_loop).is_empty():
-					# nothing drawable in it at all: a sub-pixel artefact of the
-					# booleans, with no surface worth colliding with
+					# no surface anything can draw or collide with
 					continue
-				_append_collidable(_simplified_for_collision(raw_loop), usable)
+				_append_collidable(Geometry2DUtil.remove_collinear_points(raw_loop), usable)
 	return usable
 
 
@@ -1124,7 +1117,7 @@ func _append_collidable(loop : PackedVector2Array, usable : Array[PackedVector2A
 	# whatever comes back here is what gets checked AND what gets handed on: validating
 	# one contour and then storing another is how a piece the editor cannot fill slips
 	# through a gate that just said the geometry was fine
-	var subject := _partitionable(loop)
+	var subject := loop
 	var pieces := Geometry2D.decompose_polygon_in_convex(subject)
 	if pieces.is_empty():
 		# the partitioner refused it outright, which it does for shapes the silent test
@@ -1159,50 +1152,6 @@ func _append_collidable(loop : PackedVector2Array, usable : Array[PackedVector2A
 		salvaged = true
 	if not salvaged:
 		usable.append(subject)
-
-
-# The contour in the form the convex partitioner will accept. It reports
-# `Convex decomposing failed!` when it gives up, and that is the one failure that cannot
-# be caught after the fact, so a contour that crosses itself - the shape of thing it
-# refuses - is rebuilt through Clipper before it is ever asked. A contour that merely
-# touches itself is left alone: the partitioner takes those in its stride, and rebuilding
-# them would throw away the surface of a perfectly good collider.
-func _partitionable(loop : PackedVector2Array) -> PackedVector2Array:
-	if Geometry2DUtil.is_strictly_simple(loop):
-		return loop
-	var rebuilt := Geometry2DUtil.largest_contour(Geometry2DUtil.normalize_contour(loop))
-	return loop if rebuilt.is_empty() else rebuilt
-
-
-func _simplified_for_collision(loop : PackedVector2Array) -> PackedVector2Array:
-	if _decomposes_into_drawable_pieces(loop):
-		return loop
-	var surface := Geometry2DUtil.get_polygon_area(loop)
-	for tolerance in [0.000001, 0.00001, 0.0001, 0.001, 0.005, 0.01]:
-		var candidate := Geometry2DUtil.remove_collinear_points(loop, tolerance)
-		if candidate.size() == loop.size():
-			continue
-		# a thousandth of the surface, but never less than a hundredth of a pixel: the
-		# contours that need this most are slivers of about a pixel, and a purely
-		# relative allowance leaves them no room to be trimmed at all
-		if absf(Geometry2DUtil.get_polygon_area(candidate) - surface) > maxf(surface * 0.001, 0.01):
-			break
-		if _decomposes_into_drawable_pieces(candidate):
-			return candidate
-	# nothing trimmed it into shape without moving the outline: the original geometry is
-	# returned untouched, because a collider that logs is a smaller problem than one that
-	# covers the wrong area
-	return loop
-
-
-func _decomposes_into_drawable_pieces(loop : PackedVector2Array) -> bool:
-	var pieces := Geometry2D.decompose_polygon_in_convex(_partitionable(loop))
-	if pieces.is_empty():
-		return false
-	for piece in pieces:
-		if Geometry2D.triangulate_polygon(piece).is_empty():
-			return false
-	return true
 
 
 func _make_new_collision_polygon_2d() -> CollisionPolygon2D:

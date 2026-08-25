@@ -93,67 +93,14 @@ static func normalize_contour(points : PackedVector2Array) -> Array[PackedVector
 	return pieces
 
 
-## Whether no two non-adjacent edges of the contour touch: no crossings, and no vertex
-## resting on a foreign edge. Ear clipping tolerates a surprising amount of both, so a
-## contour can triangulate and still be rejected by the convex partitioner that builds
-## a [CollisionPolygon2D]'s shapes - which prints `Convex decomposing failed!` when it
-## gives up. This is the silent test for what that partitioner will accept.
-static func is_strictly_simple(points : PackedVector2Array, tolerance := 0.001) -> bool:
-	var n := points.size()
-	if n < 4:
-		return true
-	# Edge bounding boxes first. The test is O(n^2) in the pairs it compares, and on a
-	# tessellated outline almost every pair is far apart - so the box check, which costs
-	# four comparisons, throws out the overwhelming majority before any segment maths
-	# happens. Without it this ran to two and a half milliseconds on a contour of a few
-	# hundred points, four times the cost of the convex decomposition it exists to
-	# protect from printing.
-	var lows : PackedVector2Array = []
-	var highs : PackedVector2Array = []
-	lows.resize(n)
-	highs.resize(n)
-	for i in n:
-		var a := points[i]
-		var b := points[(i + 1) % n]
-		lows[i] = Vector2(minf(a.x, b.x) - tolerance, minf(a.y, b.y) - tolerance)
-		highs[i] = Vector2(maxf(a.x, b.x) + tolerance, maxf(a.y, b.y) + tolerance)
-	for i in n:
-		var a1 := points[i]
-		var a2 := points[(i + 1) % n]
-		var low_i := lows[i]
-		var high_i := highs[i]
-		for j in range(i + 1, n):
-			if j == i + 1 or (i == 0 and j == n - 1):
-				continue
-			if high_i.x < lows[j].x or highs[j].x < low_i.x:
-				continue
-			if high_i.y < lows[j].y or highs[j].y < low_i.y:
-				continue
-			var b1 := points[j]
-			var b2 := points[(j + 1) % n]
-			if Geometry2D.segment_intersects_segment(a1, a2, b1, b2) != null:
-				return false
-			if Geometry2D.get_closest_point_to_segment(b1, a1, a2).distance_to(b1) < tolerance:
-				return false
-			if Geometry2D.get_closest_point_to_segment(a1, b1, b2).distance_to(a1) < tolerance:
-				return false
-	return true
-
-
-## Removes every vertex lying exactly on the straight edge between its two neighbours.
-## The cut of [method slice_polygons_with_holes] leaves such vertices along
-## both halves of the cut edge and re-merging keeps them: harmless to the shape itself,
-## but the convex partition of a [CollisionPolygon2D] can emit a zero-area piece at one
-## - which decomposes without complaint and then fails to draw, logging
-## `Invalid polygon data, triangulation failed.` on every editor redraw with no failing
-## decomposition in sight.
+## Removes every vertex lying exactly on the straight edge between its two neighbours,
+## which a boolean operation emits wherever it ran along one. The convex partition of a
+## [CollisionPolygon2D] can turn such a vertex into a piece with no surface, and the
+## editor reports that as `Invalid polygon data, triangulation failed.` on every redraw.
 ## [br][br]
-## The tolerance has to stay far below the curvature of a tessellated outline, whose
-## points sit a thousandth of a pixel or so off the chord between their neighbours by
-## nature. Anything looser stops removing artefacts and starts decimating the curve:
-## at 0.01 a 198 point outline collapses to 12 and loses half its surface. The default
-## catches only what is collinear to floating point precision - which is what a boolean
-## operation emits where it ran along a straight edge - and leaves every outline alone.
+## Keep the tolerance far below the curvature of a tessellated outline, whose points sit
+## a thousandth of a pixel off the chord between their neighbours by nature: at 0.01 a
+## 198 point outline collapses to 12 and loses half its surface.
 static func remove_collinear_points(points : PackedVector2Array, tolerance := 0.000001) -> PackedVector2Array:
 	if points.size() < 4:
 		return points
@@ -246,12 +193,6 @@ static func slice_polygon_through(polygon : PackedVector2Array, slice_target : V
 	for half in halves:
 		cleaned.append(_drop_vertices_along_cut(half, cut, vertical))
 	return cleaned
-
-
-## Kept under its old name for anything outside the addon that calls it.
-## @deprecated: Use [method slice_polygon_through], which cuts across the longer side.
-static func slice_polygon_vertical(polygon : PackedVector2Array, slice_target : Vector2) -> Array[PackedVector2Array]:
-	return slice_polygon_through(polygon, slice_target)
 
 
 ## Drops the vertices Clipper leaves strung along a straight cut. Where the cutting
