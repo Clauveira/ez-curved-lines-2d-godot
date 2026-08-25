@@ -9,9 +9,14 @@ const THRESHOLD = 0.1
 ## same edge through a different chain of floating point operations - a stroke extruded
 ## up against the contour of its fill, for instance - subtracting one from the other
 ## leaves slivers behind, which are not holes: slicing the result around them would
-## only fragment it. Measured slivers stay below 0.00001, a cutout of 1 pixel across
-## still covers ~3.
-const MINIMUM_HOLE_AREA = 0.1
+## only fragment it. A cutout of 1 pixel across still covers ~3.
+## [br][br]
+## The figure has to be a whole pixel rather than the fraction it was, because every
+## hole costs a cut through the whole shape and the cuts compound. An outward stroke
+## meeting its fill leaves gaps of half a pixel and up - well clear of the sliver scale
+## this was first measured at - and preserving those voids fragmented one shape into
+## twenty-two colliders where three would do.
+const MINIMUM_HOLE_AREA = 1.0
 
 static func get_polygon_bounding_rect(points : PackedVector2Array) -> Rect2:
 	var minx := INF
@@ -113,7 +118,7 @@ static func is_strictly_simple(points : PackedVector2Array, tolerance := 0.001) 
 
 
 ## Removes every vertex lying exactly on the straight edge between its two neighbours.
-## The vertical cut of [method slice_polygons_with_holes] leaves such vertices along
+## The cut of [method slice_polygons_with_holes] leaves such vertices along
 ## both halves of the cut edge and re-merging keeps them: harmless to the shape itself,
 ## but the convex partition of a [CollisionPolygon2D] can emit a zero-area piece at one
 ## - which decomposes without complaint and then fails to draw, logging
@@ -176,29 +181,58 @@ static func largest_contour(polygons : Array[PackedVector2Array]) -> PackedVecto
 	return best
 
 
-static func slice_polygon_vertical(polygon : PackedVector2Array, slice_target : Vector2) -> Array[PackedVector2Array]:
+static func slice_polygon_through(polygon : PackedVector2Array, slice_target : Vector2) -> Array[PackedVector2Array]:
 	var box := get_polygon_bounding_rect(polygon).grow(1.0)
 	if not box.has_point(slice_target):
 		return [polygon]
-	var halves := Geometry2D.intersect_polygons([
-		box.position,
-		Vector2(slice_target.x, box.position.y),
-		Vector2(slice_target.x, box.position.y + box.size.y),
-		Vector2(box.position.x, box.position.y + box.size.y),
-	], polygon) + Geometry2D.intersect_polygons([
-		Vector2(slice_target.x, box.position.y),
-		Vector2(box.position.x + box.size.x, box.position.y),
-		box.position + box.size,
-		Vector2(slice_target.x, box.position.y + box.size.y),
-	], polygon)
+	# The cut is always vertical. Choosing the axis by the bounding box - halving a tall
+	# shape horizontally rather than leaving two splinters - reads like the obvious
+	# improvement and is what a terrain cutter this was compared against does, but it
+	# was measured to make things worse here: a horizontal cut through a stroke union
+	# produces contours the convex partitioner refuses outright, which a vertical cut
+	# through the same shape does not. The shapes are not terrain pieces, and the
+	# intuition does not carry over.
+	var vertical := true
+	var cut : float = slice_target.x if vertical else slice_target.y
+	var first : PackedVector2Array
+	var second : PackedVector2Array
+	if vertical:
+		first = PackedVector2Array([
+			box.position,
+			Vector2(cut, box.position.y),
+			Vector2(cut, box.end.y),
+			Vector2(box.position.x, box.end.y)])
+		second = PackedVector2Array([
+			Vector2(cut, box.position.y),
+			Vector2(box.end.x, box.position.y),
+			box.end,
+			Vector2(cut, box.end.y)])
+	else:
+		first = PackedVector2Array([
+			box.position,
+			Vector2(box.end.x, box.position.y),
+			Vector2(box.end.x, cut),
+			Vector2(box.position.x, cut)])
+		second = PackedVector2Array([
+			Vector2(box.position.x, cut),
+			Vector2(box.end.x, cut),
+			box.end,
+			Vector2(box.position.x, box.end.y)])
+	var halves := Geometry2D.intersect_polygons(first, polygon) 			+ Geometry2D.intersect_polygons(second, polygon)
 	var cleaned : Array[PackedVector2Array] = []
 	for half in halves:
-		cleaned.append(_drop_vertices_along_cut(half, slice_target.x))
+		cleaned.append(_drop_vertices_along_cut(half, cut, vertical))
 	return cleaned
 
 
+## Kept under its old name for anything outside the addon that calls it.
+## @deprecated: Use [method slice_polygon_through], which cuts across the longer side.
+static func slice_polygon_vertical(polygon : PackedVector2Array, slice_target : Vector2) -> Array[PackedVector2Array]:
+	return slice_polygon_through(polygon, slice_target)
+
+
 ## Drops the vertices Clipper leaves strung along a straight cut. Where the cutting
-## rectangle of [method slice_polygon_vertical] runs through the polygon, the result
+## rectangle of [method slice_polygon_through] runs through the polygon, the result
 ## carries a vertex for every edge it crossed, all of them on the same x and all but
 ## the two ends redundant. They describe no shape - the run between them is one
 ## straight segment - but the convex partition of a [CollisionPolygon2D] can emit a
@@ -209,11 +243,12 @@ static func slice_polygon_vertical(polygon : PackedVector2Array, slice_target : 
 ## Only vertices whose neighbours share the cut are dropped, so the outline itself -
 ## whose points sit off the chord between their neighbours by thousandths of a pixel
 ## and are indistinguishable from an artefact by distance alone - is never touched.
-static func _drop_vertices_along_cut(polygon : PackedVector2Array, cut_x : float) -> PackedVector2Array:
+static func _drop_vertices_along_cut(polygon : PackedVector2Array, cut : float,
+			vertical : bool) -> PackedVector2Array:
 	if polygon.size() < 4:
 		return polygon
 	var on_cut : Callable = func(p : Vector2) -> bool:
-		return is_equal_approx(p.x, cut_x)
+		return is_equal_approx(p.x if vertical else p.y, cut)
 	var result : PackedVector2Array = []
 	for i in polygon.size():
 		var point := polygon[i]
@@ -268,21 +303,25 @@ static func apply_clips_to_polygon(
 
 
 static func slice_polygons_with_holes(current_polygons : Array[PackedVector2Array], holes : Array[PackedVector2Array]) -> void:
-	var result_polygons : Array[PackedVector2Array] = []
 	for hole in holes:
+		var result_polygons : Array[PackedVector2Array] = []
+		var hole_box := get_polygon_bounding_rect(hole)
 		for current_points : PackedVector2Array in current_polygons:
-			var slices := slice_polygon_vertical(
-				current_points, get_polygon_center(hole)
-			)
+			# A hole lies inside exactly one of the pieces, and cutting the others in
+			# half achieves nothing except doubling their number. Left as it was, one
+			# cut per hole per piece makes the count grow with 2^holes: a shape with a
+			# stroke wide enough to trap five voids came out as twenty-two colliders
+			# where five would do.
+			if not hole_box.intersects(get_polygon_bounding_rect(current_points)) 					or Geometry2D.intersect_polygons(hole, current_points).is_empty():
+				result_polygons.append(current_points)
+				continue
+			var slices := slice_polygon_through(current_points, get_polygon_center(hole))
 			for slice in slices:
-				var result = Geometry2D.clip_polygons(slice, hole)
-				for poly_points in result:
+				for poly_points in Geometry2D.clip_polygons(slice, hole):
 					if not Geometry2D.is_polygon_clockwise(poly_points):
 						result_polygons.append(poly_points)
 		current_polygons.clear()
 		current_polygons.append_array(result_polygons)
-		result_polygons.clear()
-
 
 
 ## Returns the smallest set of non-overlapping polygons covering exactly the same
