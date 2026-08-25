@@ -580,15 +580,21 @@ func _notification(what: int) -> void:
 		_prune_unused_colliders_and_lines()
 
 
+# Removing the node from the tree is what keeps it out of the saved scene - pack() only
+# reads the tree - but nothing releases it afterwards, so every save left the surplus
+# nodes allocated and unreachable. queue_free() is deferred past the end of the frame,
+# well after the scene has been written, so the save stays clean either way.
 func _prune_unused_colliders_and_lines():
 	if is_instance_valid(line):
 		for ch in line.get_children():
 			if ch is Line2D and not ch.visible:
 				line.remove_child(ch)
+				ch.queue_free()
 	if is_instance_valid(collision_object):
 		for ch in collision_object.get_children():
 			if ch is CollisionPolygon2D and ch.disabled and not ch.visible:
 				collision_object.remove_child(ch)
+				ch.queue_free()
 
 
 func reset_skeleton_to_rest_pose():

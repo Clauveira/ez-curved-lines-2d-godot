@@ -100,11 +100,34 @@ static func normalize_contour(points : PackedVector2Array) -> Array[PackedVector
 ## gives up. This is the silent test for what that partitioner will accept.
 static func is_strictly_simple(points : PackedVector2Array, tolerance := 0.001) -> bool:
 	var n := points.size()
+	if n < 4:
+		return true
+	# Edge bounding boxes first. The test is O(n^2) in the pairs it compares, and on a
+	# tessellated outline almost every pair is far apart - so the box check, which costs
+	# four comparisons, throws out the overwhelming majority before any segment maths
+	# happens. Without it this ran to two and a half milliseconds on a contour of a few
+	# hundred points, four times the cost of the convex decomposition it exists to
+	# protect from printing.
+	var lows : PackedVector2Array = []
+	var highs : PackedVector2Array = []
+	lows.resize(n)
+	highs.resize(n)
+	for i in n:
+		var a := points[i]
+		var b := points[(i + 1) % n]
+		lows[i] = Vector2(minf(a.x, b.x) - tolerance, minf(a.y, b.y) - tolerance)
+		highs[i] = Vector2(maxf(a.x, b.x) + tolerance, maxf(a.y, b.y) + tolerance)
 	for i in n:
 		var a1 := points[i]
 		var a2 := points[(i + 1) % n]
+		var low_i := lows[i]
+		var high_i := highs[i]
 		for j in range(i + 1, n):
 			if j == i + 1 or (i == 0 and j == n - 1):
+				continue
+			if high_i.x < lows[j].x or highs[j].x < low_i.x:
+				continue
+			if high_i.y < lows[j].y or highs[j].y < low_i.y:
 				continue
 			var b1 := points[j]
 			var b2 := points[(j + 1) % n]
