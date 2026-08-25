@@ -1,5 +1,7 @@
 # Scalable Vector Shapes 2D plugin for Godot 4
 
+This fork differs from the original by containing the use of AI. For an AI-free plugin, use the original repository: https://github.com/Teaching-myself-Godot/ez-curved-lines-2d
+
 Ask questions on [discord](https://discord.gg/CDdkVvT2Ff)
 
 Scalable Vector Shapes 2D lets you do 3 things:
