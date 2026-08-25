@@ -84,10 +84,16 @@ enum StrokeExtrusionDirection {
 }
 
 ## The surface below which a contour is not worth a [CollisionPolygon2D]: at this scale
-## it is an artefact of a boolean operation rather than a piece of shape - a collider
-## 0.3 px across collides with nothing, and Godot cannot triangulate it to draw it in
-## the editor. Same order of magnitude as [constant Geometry2DUtil.MINIMUM_HOLE_AREA].
-const MINIMUM_COLLISION_AREA := 0.1
+## it is an artefact of a boolean operation rather than a piece of shape. A collider
+## covering less than a pixel collides with nothing, and its convex partition is all
+## but guaranteed to contain a piece with no surface at all - which the editor cannot
+## fill, and reports as `Invalid polygon data, triangulation failed.` on every redraw.
+## [br][br]
+## It has to be a whole pixel rather than a fraction of one, because the same figure
+## decides which pieces of a partition are worth keeping: a contour of a tenth of a
+## pixel clears a tenth-of-a-pixel bar, then splits into pieces that all fall under it,
+## leaving nothing to keep and nothing to do but hand the bad contour on.
+const MINIMUM_COLLISION_AREA := 1.0
 
 
 ## Determines which area the [CollisionPolygon2D] nodes generated for the
@@ -1109,9 +1115,13 @@ func _collidable_contours(contours : Array[PackedVector2Array]) -> Array[PackedV
 # left to fail, and dropping an empty piece costs no collision area. It buys a handful
 # of extra nodes for the few contours that need it.
 func _append_collidable(loop : PackedVector2Array, usable : Array[PackedVector2Array]) -> void:
-	var pieces := _decompose_quietly(loop)
+	# whatever comes back here is what gets checked AND what gets handed on: validating
+	# one contour and then storing another is how a piece the editor cannot fill slips
+	# through a gate that just said the geometry was fine
+	var subject := _partitionable(loop)
+	var pieces := Geometry2D.decompose_polygon_in_convex(subject)
 	if pieces.is_empty():
-		usable.append(loop)
+		usable.append(subject)
 		return
 	var degenerate := false
 	for piece in pieces:
@@ -1119,37 +1129,32 @@ func _append_collidable(loop : PackedVector2Array, usable : Array[PackedVector2A
 			degenerate = true
 			break
 	if not degenerate:
-		usable.append(loop)
+		usable.append(subject)
 		return
+	# every piece that draws is kept, however small. They are what the surface is made
+	# of, and the ones left out have no surface to lose - filtering these by area is how
+	# a contour ends up with nothing salvaged and the bad geometry handed on anyway.
 	var salvaged := false
 	for piece in pieces:
-		if Geometry2DUtil.get_polygon_area(piece) <= MINIMUM_COLLISION_AREA:
-			continue
 		if Geometry2D.triangulate_polygon(piece).is_empty():
 			continue
 		usable.append(piece)
 		salvaged = true
 	if not salvaged:
-		usable.append(loop)
+		usable.append(subject)
 
 
-# Convex decomposition, with the one contour shape the partitioner refuses handed to
-# Clipper first so it never has to. It reports `Convex decomposing failed!` when it
-# gives up, and that is the one failure that cannot be caught after the fact, so a
-# contour that crosses itself is rebuilt before it is asked. A contour that merely
-# touches itself is not: the partitioner takes those in its stride, and rejecting them
-# would throw away the surface of a perfectly good collider.
-func _decompose_quietly(loop : PackedVector2Array) -> Array[PackedVector2Array]:
-	var subject := loop
-	if not Geometry2DUtil.is_strictly_simple(loop):
-		var rebuilt := Geometry2DUtil.largest_contour(
-				Geometry2DUtil.normalize_contour(loop))
-		if not rebuilt.is_empty():
-			subject = rebuilt
-	var result : Array[PackedVector2Array] = []
-	for piece in Geometry2D.decompose_polygon_in_convex(subject):
-		result.append(piece)
-	return result
+# The contour in the form the convex partitioner will accept. It reports
+# `Convex decomposing failed!` when it gives up, and that is the one failure that cannot
+# be caught after the fact, so a contour that crosses itself - the shape of thing it
+# refuses - is rebuilt through Clipper before it is ever asked. A contour that merely
+# touches itself is left alone: the partitioner takes those in its stride, and rebuilding
+# them would throw away the surface of a perfectly good collider.
+func _partitionable(loop : PackedVector2Array) -> PackedVector2Array:
+	if Geometry2DUtil.is_strictly_simple(loop):
+		return loop
+	var rebuilt := Geometry2DUtil.largest_contour(Geometry2DUtil.normalize_contour(loop))
+	return loop if rebuilt.is_empty() else rebuilt
 
 
 func _simplified_for_collision(loop : PackedVector2Array) -> PackedVector2Array:
@@ -1174,7 +1179,7 @@ func _simplified_for_collision(loop : PackedVector2Array) -> PackedVector2Array:
 
 
 func _decomposes_into_drawable_pieces(loop : PackedVector2Array) -> bool:
-	var pieces := Geometry2D.decompose_polygon_in_convex(loop)
+	var pieces := Geometry2D.decompose_polygon_in_convex(_partitionable(loop))
 	if pieces.is_empty():
 		return false
 	for piece in pieces:
