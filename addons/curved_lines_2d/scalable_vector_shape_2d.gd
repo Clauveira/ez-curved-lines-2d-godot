@@ -1091,11 +1091,6 @@ func _collidable_contours(contours : Array[PackedVector2Array]) -> Array[PackedV
 					# nothing drawable in it at all: a sub-pixel artefact of the
 					# booleans, with no surface worth colliding with
 					continue
-				if not Geometry2DUtil.is_strictly_simple(raw_loop):
-					# ear clipping tolerated its crossings, the convex partitioner
-					# will not: resolve them through Clipper before it is handed on
-					_append_resolved_collidable_loops(raw_loop, usable)
-					continue
 				_append_collidable(_simplified_for_collision(raw_loop), usable)
 	return usable
 
@@ -1114,11 +1109,20 @@ func _collidable_contours(contours : Array[PackedVector2Array]) -> Array[PackedV
 # left to fail, and dropping an empty piece costs no collision area. It buys a handful
 # of extra nodes for the few contours that need it.
 func _append_collidable(loop : PackedVector2Array, usable : Array[PackedVector2Array]) -> void:
-	if _decomposes_into_drawable_pieces(loop):
+	var pieces := _decompose_quietly(loop)
+	if pieces.is_empty():
+		usable.append(loop)
+		return
+	var degenerate := false
+	for piece in pieces:
+		if Geometry2D.triangulate_polygon(piece).is_empty():
+			degenerate = true
+			break
+	if not degenerate:
 		usable.append(loop)
 		return
 	var salvaged := false
-	for piece in Geometry2D.decompose_polygon_in_convex(loop):
+	for piece in pieces:
 		if Geometry2DUtil.get_polygon_area(piece) <= MINIMUM_COLLISION_AREA:
 			continue
 		if Geometry2D.triangulate_polygon(piece).is_empty():
@@ -1129,17 +1133,25 @@ func _append_collidable(loop : PackedVector2Array, usable : Array[PackedVector2A
 		usable.append(loop)
 
 
-# Trims the vertices the slice line leaves lying on their own edge, using the loosest
-# tolerance that does not move the outline: the convex partition emits a zero-area piece
-# at such a vertex, which decomposes without complaint and then fails to draw, and the
-# editor redraws every CollisionPolygon2D on every frame.
-#
-# The tolerance has to be found rather than fixed. A tessellated outline curves by
-# thousandths of a pixel between neighbours, so one loose enough to catch every artefact
-# would decimate the curve - 0.01 collapses a 198 point outline to 12 and takes half its
-# surface with it. So it starts far below that and only loosens while the surface holds,
-# and the contour is returned whatever happens: a collider that logs is a smaller problem
-# than a collider that is not there.
+# Convex decomposition, with the one contour shape the partitioner refuses handed to
+# Clipper first so it never has to. It reports `Convex decomposing failed!` when it
+# gives up, and that is the one failure that cannot be caught after the fact, so a
+# contour that crosses itself is rebuilt before it is asked. A contour that merely
+# touches itself is not: the partitioner takes those in its stride, and rejecting them
+# would throw away the surface of a perfectly good collider.
+func _decompose_quietly(loop : PackedVector2Array) -> Array[PackedVector2Array]:
+	var subject := loop
+	if not Geometry2DUtil.is_strictly_simple(loop):
+		var rebuilt := Geometry2DUtil.largest_contour(
+				Geometry2DUtil.normalize_contour(loop))
+		if not rebuilt.is_empty():
+			subject = rebuilt
+	var result : Array[PackedVector2Array] = []
+	for piece in Geometry2D.decompose_polygon_in_convex(subject):
+		result.append(piece)
+	return result
+
+
 func _simplified_for_collision(loop : PackedVector2Array) -> PackedVector2Array:
 	if _decomposes_into_drawable_pieces(loop):
 		return loop
@@ -1161,36 +1173,6 @@ func _simplified_for_collision(loop : PackedVector2Array) -> PackedVector2Array:
 	return loop
 
 
-# One silent resolution attempt for a loop that triangulates but is not strictly
-# simple: merging it with itself makes Clipper resolve the crossings. What comes
-# back is held to every gate again; what still fails is dropped without a node -
-# never handed to the partitioner, which would print `Convex decomposing failed!`.
-func _append_resolved_collidable_loops(loop : PackedVector2Array,
-			usable : Array[PackedVector2Array]) -> void:
-	for piece in Geometry2D.merge_polygons(loop, loop):
-		if Geometry2D.is_polygon_clockwise(piece):
-			continue
-		for cleaned in Geometry2DUtil.split_at_pinch_points(
-				Geometry2DUtil.remove_duplicate_points(piece)):
-			if cleaned.size() < 3:
-				continue
-			if Geometry2DUtil.get_polygon_area(cleaned) <= MINIMUM_COLLISION_AREA:
-				continue
-			if Geometry2D.triangulate_polygon(cleaned).is_empty():
-				continue
-			if not Geometry2DUtil.is_strictly_simple(cleaned):
-				continue
-			_append_collidable(_simplified_for_collision(cleaned), usable)
-
-
-# The exact criterion the editor applies when it draws a CollisionPolygon2D: convex
-# decomposition, then a triangulated fill per piece. A sliver left over from booleans -
-# a band a fraction of a pixel wide between the stroke and the fill it hugs, as
-# described in #396 - can pass every contour-level check and still decompose into
-# near-zero pieces the fill rejects, logging `Invalid polygon data` on every redraw.
-# The decompose call is silent whenever it succeeds; the gates above make the failing
-# (printing) case all but impossible, and a contour that fails it here is dropped, so
-# it prints once per recompute at worst - never once per redraw.
 func _decomposes_into_drawable_pieces(loop : PackedVector2Array) -> bool:
 	var pieces := Geometry2D.decompose_polygon_in_convex(loop)
 	if pieces.is_empty():
