@@ -77,7 +77,8 @@ static func normalize_contour(points : PackedVector2Array) -> Array[PackedVector
 		if Geometry2D.is_polygon_clockwise(piece):
 			continue
 		# the merge can hand a weakly simple contour straight back - lobes pinched
-		# together at a repeated vertex - which not even ear clipping digests reliably
+		# together at a repeated vertex - which not even ear clipping digests reliably,
+		# and it strings vertices along wherever it ran down a straight edge
 		for loop in split_at_pinch_points(remove_duplicate_points(piece)):
 			if loop.size() > 2 and not Geometry2D.triangulate_polygon(loop).is_empty():
 				pieces.append(loop)
@@ -111,14 +112,21 @@ static func is_strictly_simple(points : PackedVector2Array, tolerance := 0.001) 
 	return true
 
 
-## Removes every vertex lying sub-pixel close to the straight edge between its two
-## neighbours. The vertical cut of [method slice_polygons_with_holes] leaves such
-## vertices along both halves of the cut edge and re-merging keeps them: harmless to
-## the shape itself, but the convex partition of a [CollisionPolygon2D] can emit a
-## zero-area piece at one - which decomposes without complaint and then fails to draw,
-## logging `Invalid polygon data, triangulation failed.` on every editor redraw with
-## no failing decomposition in sight.
-static func remove_collinear_points(points : PackedVector2Array, tolerance := 0.01) -> PackedVector2Array:
+## Removes every vertex lying exactly on the straight edge between its two neighbours.
+## The vertical cut of [method slice_polygons_with_holes] leaves such vertices along
+## both halves of the cut edge and re-merging keeps them: harmless to the shape itself,
+## but the convex partition of a [CollisionPolygon2D] can emit a zero-area piece at one
+## - which decomposes without complaint and then fails to draw, logging
+## `Invalid polygon data, triangulation failed.` on every editor redraw with no failing
+## decomposition in sight.
+## [br][br]
+## The tolerance has to stay far below the curvature of a tessellated outline, whose
+## points sit a thousandth of a pixel or so off the chord between their neighbours by
+## nature. Anything looser stops removing artefacts and starts decimating the curve:
+## at 0.01 a 198 point outline collapses to 12 and loses half its surface. The default
+## catches only what is collinear to floating point precision - which is what a boolean
+## operation emits where it ran along a straight edge - and leaves every outline alone.
+static func remove_collinear_points(points : PackedVector2Array, tolerance := 0.000001) -> PackedVector2Array:
 	if points.size() < 4:
 		return points
 	var result : PackedVector2Array = []
@@ -172,7 +180,7 @@ static func slice_polygon_vertical(polygon : PackedVector2Array, slice_target : 
 	var box := get_polygon_bounding_rect(polygon).grow(1.0)
 	if not box.has_point(slice_target):
 		return [polygon]
-	return Geometry2D.intersect_polygons([
+	var halves := Geometry2D.intersect_polygons([
 		box.position,
 		Vector2(slice_target.x, box.position.y),
 		Vector2(slice_target.x, box.position.y + box.size.y),
@@ -183,6 +191,41 @@ static func slice_polygon_vertical(polygon : PackedVector2Array, slice_target : 
 		box.position + box.size,
 		Vector2(slice_target.x, box.position.y + box.size.y),
 	], polygon)
+	var cleaned : Array[PackedVector2Array] = []
+	for half in halves:
+		cleaned.append(_drop_vertices_along_cut(half, slice_target.x))
+	return cleaned
+
+
+## Drops the vertices Clipper leaves strung along a straight cut. Where the cutting
+## rectangle of [method slice_polygon_vertical] runs through the polygon, the result
+## carries a vertex for every edge it crossed, all of them on the same x and all but
+## the two ends redundant. They describe no shape - the run between them is one
+## straight segment - but the convex partition of a [CollisionPolygon2D] can emit a
+## zero-area piece at each, which decomposes without complaint and then cannot be
+## drawn, so the editor reports `Invalid polygon data, triangulation failed.` on every
+## redraw for as long as the collider exists.
+## [br][br]
+## Only vertices whose neighbours share the cut are dropped, so the outline itself -
+## whose points sit off the chord between their neighbours by thousandths of a pixel
+## and are indistinguishable from an artefact by distance alone - is never touched.
+static func _drop_vertices_along_cut(polygon : PackedVector2Array, cut_x : float) -> PackedVector2Array:
+	if polygon.size() < 4:
+		return polygon
+	var on_cut : Callable = func(p : Vector2) -> bool:
+		return is_equal_approx(p.x, cut_x)
+	var result : PackedVector2Array = []
+	for i in polygon.size():
+		var point := polygon[i]
+		if not on_cut.call(point):
+			result.append(point)
+			continue
+		var previous := polygon[(i - 1 + polygon.size()) % polygon.size()]
+		var next := polygon[(i + 1) % polygon.size()]
+		if on_cut.call(previous) and on_cut.call(next):
+			continue
+		result.append(point)
+	return result if result.size() > 2 else polygon
 
 
 static func apply_polygon_bool_operation_in_place(

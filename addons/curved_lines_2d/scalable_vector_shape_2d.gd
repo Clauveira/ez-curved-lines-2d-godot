@@ -83,8 +83,6 @@ enum StrokeExtrusionDirection {
 	INWARD
 }
 
-## Determines which area the [CollisionPolygon2D] nodes generated for the
-## [member collision_object] cover, see [member collision_mode]
 ## The surface below which a contour is not worth a [CollisionPolygon2D]: at this scale
 ## it is an artefact of a boolean operation rather than a piece of shape - a collider
 ## 0.3 px across collides with nothing, and Godot cannot triangulate it to draw it in
@@ -92,6 +90,8 @@ enum StrokeExtrusionDirection {
 const MINIMUM_COLLISION_AREA := 0.1
 
 
+## Determines which area the [CollisionPolygon2D] nodes generated for the
+## [member collision_object] cover, see [member collision_mode]
 enum CollisionMode {
 	## Generates the smallest possible set of [CollisionPolygon2D] nodes covering the
 	## fill and the stroke as one single area, in stead of one set per shape.
@@ -1085,25 +1085,80 @@ func _collidable_contours(contours : Array[PackedVector2Array]) -> Array[PackedV
 	for contour in contours:
 		for piece in Geometry2DUtil.normalize_contour(contour):
 			for raw_loop in Geometry2DUtil.split_at_pinch_points(piece):
-				# the slice line leaves collinear vertices along the cut: the convex
-				# partition emits a zero-area piece at each, which the editor then
-				# fails to draw - see remove_collinear_points
-				var loop := Geometry2DUtil.remove_collinear_points(raw_loop)
-				if Geometry2DUtil.get_polygon_area(loop) <= MINIMUM_COLLISION_AREA:
+				if Geometry2DUtil.get_polygon_area(raw_loop) <= MINIMUM_COLLISION_AREA:
 					continue
-				if Geometry2D.triangulate_polygon(loop).is_empty():
-					# still not drawable after normalization: a sub-pixel artefact
+				if Geometry2D.triangulate_polygon(raw_loop).is_empty():
+					# nothing drawable in it at all: a sub-pixel artefact of the
+					# booleans, with no surface worth colliding with
 					continue
-				if not Geometry2DUtil.is_strictly_simple(loop):
+				if not Geometry2DUtil.is_strictly_simple(raw_loop):
 					# ear clipping tolerated its crossings, the convex partitioner
-					# will not: resolve them silently in stead of letting the
-					# partitioner print - once more through Clipper, then give up
-					_append_resolved_collidable_loops(loop, usable)
+					# will not: resolve them through Clipper before it is handed on
+					_append_resolved_collidable_loops(raw_loop, usable)
 					continue
-				if not _decomposes_into_drawable_pieces(loop):
-					continue
-				usable.append(loop)
+				_append_collidable(_simplified_for_collision(raw_loop), usable)
 	return usable
+
+
+# Adds a contour to the set the CollisionPolygon2D nodes are built from, in the form
+# the editor can actually draw.
+#
+# The editor renders a collider by convex-decomposing it and filling each piece, and a
+# thin enough contour makes the partitioner emit a piece with no surface: the
+# decomposition reports success, the fill of that one piece fails, and the log fills up
+# with `Invalid polygon data, triangulation failed.` - once per redraw, forever. Some
+# contours cannot be trimmed out of that state without moving the outline.
+#
+# For those the decomposition itself becomes the collider: one node per convex piece,
+# minus the pieces with no surface. Convex pieces need no decomposing, so nothing is
+# left to fail, and dropping an empty piece costs no collision area. It buys a handful
+# of extra nodes for the few contours that need it.
+func _append_collidable(loop : PackedVector2Array, usable : Array[PackedVector2Array]) -> void:
+	if _decomposes_into_drawable_pieces(loop):
+		usable.append(loop)
+		return
+	var salvaged := false
+	for piece in Geometry2D.decompose_polygon_in_convex(loop):
+		if Geometry2DUtil.get_polygon_area(piece) <= MINIMUM_COLLISION_AREA:
+			continue
+		if Geometry2D.triangulate_polygon(piece).is_empty():
+			continue
+		usable.append(piece)
+		salvaged = true
+	if not salvaged:
+		usable.append(loop)
+
+
+# Trims the vertices the slice line leaves lying on their own edge, using the loosest
+# tolerance that does not move the outline: the convex partition emits a zero-area piece
+# at such a vertex, which decomposes without complaint and then fails to draw, and the
+# editor redraws every CollisionPolygon2D on every frame.
+#
+# The tolerance has to be found rather than fixed. A tessellated outline curves by
+# thousandths of a pixel between neighbours, so one loose enough to catch every artefact
+# would decimate the curve - 0.01 collapses a 198 point outline to 12 and takes half its
+# surface with it. So it starts far below that and only loosens while the surface holds,
+# and the contour is returned whatever happens: a collider that logs is a smaller problem
+# than a collider that is not there.
+func _simplified_for_collision(loop : PackedVector2Array) -> PackedVector2Array:
+	if _decomposes_into_drawable_pieces(loop):
+		return loop
+	var surface := Geometry2DUtil.get_polygon_area(loop)
+	for tolerance in [0.000001, 0.00001, 0.0001, 0.001, 0.005, 0.01]:
+		var candidate := Geometry2DUtil.remove_collinear_points(loop, tolerance)
+		if candidate.size() == loop.size():
+			continue
+		# a thousandth of the surface, but never less than a hundredth of a pixel: the
+		# contours that need this most are slivers of about a pixel, and a purely
+		# relative allowance leaves them no room to be trimmed at all
+		if absf(Geometry2DUtil.get_polygon_area(candidate) - surface) > maxf(surface * 0.001, 0.01):
+			break
+		if _decomposes_into_drawable_pieces(candidate):
+			return candidate
+	# nothing trimmed it into shape without moving the outline: the original geometry is
+	# returned untouched, because a collider that logs is a smaller problem than one that
+	# covers the wrong area
+	return loop
 
 
 # One silent resolution attempt for a loop that triangulates but is not strictly
@@ -1115,9 +1170,8 @@ func _append_resolved_collidable_loops(loop : PackedVector2Array,
 	for piece in Geometry2D.merge_polygons(loop, loop):
 		if Geometry2D.is_polygon_clockwise(piece):
 			continue
-		for sub in Geometry2DUtil.split_at_pinch_points(
+		for cleaned in Geometry2DUtil.split_at_pinch_points(
 				Geometry2DUtil.remove_duplicate_points(piece)):
-			var cleaned := Geometry2DUtil.remove_collinear_points(sub)
 			if cleaned.size() < 3:
 				continue
 			if Geometry2DUtil.get_polygon_area(cleaned) <= MINIMUM_COLLISION_AREA:
@@ -1126,9 +1180,7 @@ func _append_resolved_collidable_loops(loop : PackedVector2Array,
 				continue
 			if not Geometry2DUtil.is_strictly_simple(cleaned):
 				continue
-			if not _decomposes_into_drawable_pieces(cleaned):
-				continue
-			usable.append(cleaned)
+			_append_collidable(_simplified_for_collision(cleaned), usable)
 
 
 # The exact criterion the editor applies when it draws a CollisionPolygon2D: convex
