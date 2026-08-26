@@ -57,7 +57,7 @@ enum ShapeType {
 	## Provides one handle to change [member size]. The [member size] determines the radii of the
 	## ellipse on the y- and x- axis, so [member rx] and [member ry] are always sync'ed with
 	## [member size] (and vice-versa)
-		## The [member offset] can change by using the pivot-tool in the 2D Editor
+	## The [member offset] can change by using the pivot-tool in the 2D Editor
 	ELLIPSE
 }
 
@@ -70,6 +70,25 @@ enum CollisionObjectType {
 	CHARACTER_BODY_2D,
 	PHYSICAL_BONE_2D
 }
+
+enum StrokeExtrusionDirection {
+	## The default for a stroke is to draw outward of its defined polyline in both directions
+	## So if the [member stroke_width] is 8px, it draws 4px inward and 4px outward
+	MIDDLE,
+	## If the stroke extrusion direction is set to outward, it will be drawn outside its polyline points
+	## So if the [member stroke_width] is 8px, it draws 0px inward and 8px outward
+	OUTWARD,
+	## If the stroke extrusion direction is set to inward, it will be drawn inside its polyline points
+	## So if the [member stroke_width] is 8px, it draws 8px inward and 0px outward
+	INWARD
+}
+
+## The surface below which a contour is not worth a [CollisionPolygon2D]. A collider
+## covering less than a pixel collides with nothing, and its convex partition is all but
+## guaranteed to contain a piece with no surface for the editor to fill - which it
+## reports as `Invalid polygon data, triangulation failed.` on every redraw.
+const MINIMUM_COLLISION_AREA := 1.0
+
 
 ## Determines which area the [CollisionPolygon2D] nodes generated for the
 ## [member collision_object] cover, see [member collision_mode]
@@ -160,6 +179,14 @@ var stroke_width := 10.0:
 		if is_instance_valid(line):
 			line.joint_mode = _ljm
 		assigned_node_changed.emit()
+
+
+## The extrusion direction of the stroke. Only applies for closed shapes.
+@export var extrusion_direction := StrokeExtrusionDirection.MIDDLE:
+	set(_ed):
+		extrusion_direction = _ed
+		assigned_node_changed.emit()
+
 
 ## The 'Stroke' of a [ScalableVectorShape2D] is simply an instance of a [Line2D] node
 ## assigned to the `line` property.
@@ -543,12 +570,35 @@ func _notification(what: int) -> void:
 	if what == NOTIFICATION_LOCAL_TRANSFORM_CHANGED or what == NOTIFICATION_TRANSFORM_CHANGED:
 		transform_changed.emit(self)
 	if what == NOTIFICATION_EDITOR_PRE_SAVE:
-		if is_instance_valid(skeleton):
-			for i in skeleton.get_bone_count():
-				skeleton.get_bone(i).apply_rest()
-			if is_instance_valid(bone):
-				global_position = bone.global_position
-				global_rotation = bone.global_rotation
+		reset_skeleton_to_rest_pose()
+		_prune_unused_colliders_and_lines()
+
+
+# Removing the node from the tree is what keeps it out of the saved scene - pack() only
+# reads the tree - but nothing releases it afterwards, so every save left the surplus
+# nodes allocated and unreachable. queue_free() is deferred past the end of the frame,
+# well after the scene has been written, so the save stays clean either way.
+func _prune_unused_colliders_and_lines():
+	if is_instance_valid(line):
+		for ch in line.get_children():
+			if ch is Line2D and not ch.visible:
+				line.remove_child(ch)
+				ch.queue_free()
+	if is_instance_valid(collision_object):
+		for ch in collision_object.get_children():
+			if ch is CollisionPolygon2D and ch.disabled and not ch.visible:
+				collision_object.remove_child(ch)
+				ch.queue_free()
+
+
+func reset_skeleton_to_rest_pose():
+	if is_instance_valid(skeleton):
+		for i in skeleton.get_bone_count():
+			skeleton.get_bone(i).apply_rest()
+		if is_instance_valid(bone):
+			global_position = bone.global_position
+			global_rotation = bone.global_rotation
+
 
 func _on_dimensions_changed():
 	if shape_type == ShapeType.RECT:
@@ -767,8 +817,11 @@ func _update_assigned_nodes(polygon_points : PackedVector2Array) -> void:
 
 	if (is_instance_valid(poly_stroke) or (is_instance_valid(line) and is_instance_valid(collision_object)) or (is_instance_valid(line) and is_instance_valid(navigation_region))) and not cached_outline.size() < 2:
 		var cap_mode := Geometry2D.END_JOINED if is_curve_closed() else CAP_MODE_MAP[begin_cap_mode]
-		var result := Geometry2DUtil.calculate_polystroke(cached_outline,
-				stroke_width * 0.5, cap_mode, JOINT_MODE_MAP[line_joint_mode])
+		var result := Geometry2DUtil.calculate_polystroke(
+				cached_outline, stroke_width * 0.5,
+				cap_mode, JOINT_MODE_MAP[line_joint_mode],
+				_get_stroke_extrusion(cached_outline)
+		)
 		cached_poly_strokes = result
 		if is_instance_valid(navigation_region):
 			navigation_polygons.append_array(cached_poly_strokes)
@@ -782,20 +835,37 @@ func _update_assigned_nodes(polygon_points : PackedVector2Array) -> void:
 		navigation_polygons.append(polygon_points)
 
 	if is_instance_valid(line):
-		line.points = polygon_points
+		if not extrusion_direction == StrokeExtrusionDirection.MIDDLE and is_curve_closed():
+			line.points = _get_stroke_points_with_extrusion(polygon_points)
+		else:
+			line.points = polygon_points
 		line.closed = is_curve_closed()
 	if is_instance_valid(poly_stroke):
 		var polygon_indices : Array = []
-		var poly := Geometry2DUtil.get_polygon_indices(cached_poly_strokes, polygon_indices)
+		var poly := Geometry2DUtil.get_polygon_indices(
+				Geometry2DUtil.normalize_contours(cached_poly_strokes), polygon_indices)
 		poly_stroke.polygon = poly
 		poly_stroke.polygons = polygon_indices
 		_update_polygon_texture(poly_stroke, true)
 	if is_instance_valid(polygon):
+		var fill_contours := Geometry2DUtil.normalize_contour(polygon_points)
 		polygon.polygons.clear()
-		polygon.polygon = polygon_points
+		if fill_contours.size() > 1:
+			# the outline crosses itself: fill each lobe as a contour of its own,
+			# in stead of handing Polygon2D a shape it cannot triangulate
+			var fill_indices : Array = []
+			polygon.polygon = Geometry2DUtil.get_polygon_indices(fill_contours, fill_indices)
+			polygon.polygons = fill_indices
+		elif not fill_contours.is_empty():
+			polygon.polygon = fill_contours[0]
+		else:
+			# nothing drawable in this contour: park the node empty in stead of handing
+			# it a polygon it will fail to triangulate on every redraw
+			polygon.polygon = polygon_points if polygon_points.size() < 3 else PackedVector2Array()
 		_update_polygon_texture()
 	if is_instance_valid(collision_polygon):
-		collision_polygon.polygon = polygon_points
+		collision_polygon.polygon = Geometry2DUtil.largest_contour(
+				_collidable_contours([polygon_points]))
 	if is_instance_valid(collision_object):
 		var fill_polygons : Array[PackedVector2Array] = [polygon_points]
 		_update_collision_polygons(_get_collision_polygons(fill_polygons))
@@ -825,20 +895,39 @@ func _update_polygon_texture(poly := polygon, grow := false):
 				poly.texture_scale = poly.texture.get_size() / box.size
 
 
-func _update_assigned_nodes_with_clips(polygon_points : PackedVector2Array, valid_clip_paths : Array[ScalableVectorShape2D]) -> void:
+func _get_stroke_extrusion(points : PackedVector2Array, is_hole := false) -> float:
+	if extrusion_direction == StrokeExtrusionDirection.MIDDLE or not is_curve_closed():
+		return 0.0
+	var offs := -stroke_width * 0.5 if extrusion_direction == StrokeExtrusionDirection.INWARD else stroke_width * 0.5
+	if is_hole:
+		return -offs
+	return offs
 
+
+func _get_stroke_points_with_extrusion(pts : PackedVector2Array, is_hole := false) -> PackedVector2Array:
+	var extrusion := _get_stroke_extrusion(pts, is_hole)
+	if is_zero_approx(extrusion):
+		return pts
+	var extruded_result := Geometry2D.offset_polygon(pts, extrusion, JOINT_MODE_MAP[line_joint_mode])
+	return pts if extruded_result.is_empty() else extruded_result[0]
+
+
+func _update_assigned_nodes_with_clips(polygon_points : PackedVector2Array, valid_clip_paths : Array[ScalableVectorShape2D]) -> void:
 	var merges := valid_clip_paths.filter(func(cp : ScalableVectorShape2D): return cp.use_union_in_stead_of_clipping)
 	var clips := valid_clip_paths.filter(func(cp : ScalableVectorShape2D): return cp.use_interect_when_clipping)
 	var cutouts := valid_clip_paths.filter(func(cp : ScalableVectorShape2D): return not cp.use_interect_when_clipping and not cp.use_union_in_stead_of_clipping)
 
+	# a self-crossing outline - the shape's own or a clip path's - would poison every
+	# boolean operation below and end up on nodes that cannot triangulate it, so each
+	# contour is resolved into simple pieces before it enters the pipeline
 	var merge_results := Geometry2DUtil.apply_clips_to_polygon(
-		[polygon_points],
-		Array(merges.map(_clip_path_to_local), TYPE_PACKED_VECTOR2_ARRAY, "", null),
+		Geometry2DUtil.normalize_contour(polygon_points),
+		Geometry2DUtil.normalize_contours(Array(merges.map(_clip_path_to_local), TYPE_PACKED_VECTOR2_ARRAY, "", null)),
 		Geometry2D.PolyBooleanOperation.OPERATION_UNION
 	)
 	var cutout_results := Geometry2DUtil.apply_clips_to_polygon(
 		merge_results,
-		Array(cutouts.map(_clip_path_to_local), TYPE_PACKED_VECTOR2_ARRAY, "", null),
+		Geometry2DUtil.normalize_contours(Array(cutouts.map(_clip_path_to_local), TYPE_PACKED_VECTOR2_ARRAY, "", null)),
 		Geometry2D.PolyBooleanOperation.OPERATION_DIFFERENCE
 	)
 
@@ -850,18 +939,21 @@ func _update_assigned_nodes_with_clips(polygon_points : PackedVector2Array, vali
 				[]
 		)
 		var polystroke_result : Array[PackedVector2Array] = []
-		for polyline in cutout_result_polylines:
+		for i in cutout_result_polylines.size():
+			var polyline := cutout_result_polylines[i]
 			polystroke_result.append_array(Geometry2DUtil.calculate_polystroke(polyline,
-					stroke_width * 0.5, Geometry2D.END_JOINED, JOINT_MODE_MAP[line_joint_mode]))
+					stroke_width * 0.5, Geometry2D.END_JOINED, JOINT_MODE_MAP[line_joint_mode],
+					_get_stroke_extrusion(polyline, i > 0)
+			))
 		intersect_results_polystroke = Geometry2DUtil.apply_clips_to_polygon(
 			polystroke_result,
-			Array(clips.map(_clip_path_to_local), TYPE_PACKED_VECTOR2_ARRAY, "", null),
+			Geometry2DUtil.normalize_contours(Array(clips.map(_clip_path_to_local), TYPE_PACKED_VECTOR2_ARRAY, "", null)),
 			Geometry2D.PolyBooleanOperation.OPERATION_INTERSECTION
 		)
 
 	var intersect_results_fill_polygon := Geometry2DUtil.apply_clips_to_polygon(
 		cutout_results,
-		Array(clips.map(_clip_path_to_local), TYPE_PACKED_VECTOR2_ARRAY, "", null),
+		Geometry2DUtil.normalize_contours(Array(clips.map(_clip_path_to_local), TYPE_PACKED_VECTOR2_ARRAY, "", null)),
 		Geometry2D.PolyBooleanOperation.OPERATION_INTERSECTION
 	)
 
@@ -880,7 +972,8 @@ func _update_assigned_nodes_with_clips(polygon_points : PackedVector2Array, vali
 		else:
 			var polylines := Geometry2DUtil.calculate_outlines(cached_clipped_polygons.duplicate())
 			line.show()
-			line.points = polylines.pop_front()
+			line.points = _get_stroke_points_with_extrusion(polylines.pop_front())
+
 			# FIXME: closes the loop when original line is not closed
 			line.closed = true
 			var existing = line.get_children().filter(func(c): return c is Line2D)
@@ -890,20 +983,22 @@ func _update_assigned_nodes_with_clips(polygon_points : PackedVector2Array, vali
 			for polyline_index in polylines.size():
 				if polyline_index >= existing.size():
 					existing.append(_make_new_line_2d())
-				existing[polyline_index].points = polylines[polyline_index]
+				existing[polyline_index].points = _get_stroke_points_with_extrusion(polylines[polyline_index], true)
 				existing[polyline_index].width = line.width
 				existing[polyline_index].begin_cap_mode = line.begin_cap_mode
 				existing[polyline_index].end_cap_mode = line.end_cap_mode
 				existing[polyline_index].joint_mode = line.joint_mode
 				existing[polyline_index].default_color = line.default_color
 				existing[polyline_index].show()
+
 	if is_instance_valid(poly_stroke):
 		if cached_poly_strokes.is_empty():
 			poly_stroke.hide()
 		else:
 			poly_stroke.show()
 			var polygon_indices : Array = []
-			var poly := Geometry2DUtil.get_polygon_indices(cached_poly_strokes, polygon_indices)
+			var poly := Geometry2DUtil.get_polygon_indices(
+					Geometry2DUtil.normalize_contours(cached_poly_strokes), polygon_indices)
 			poly_stroke.polygon = poly
 			poly_stroke.polygons = polygon_indices
 			_update_polygon_texture(poly_stroke, true)
@@ -913,12 +1008,16 @@ func _update_assigned_nodes_with_clips(polygon_points : PackedVector2Array, vali
 		else:
 			polygon.show()
 			var polygon_indices : Array = []
-			var poly := Geometry2DUtil.get_polygon_indices(cached_clipped_polygons, polygon_indices)
+			# the boolean pipeline can still hand back a piece the triangulator
+			# rejects - resolve those before Polygon2D has to draw them
+			var poly := Geometry2DUtil.get_polygon_indices(
+					Geometry2DUtil.normalize_contours(cached_clipped_polygons), polygon_indices)
 			polygon.polygon = poly
 			polygon.polygons = polygon_indices
 			_update_polygon_texture()
 	if is_instance_valid(collision_polygon):
-		collision_polygon.polygon = polygon_points
+		collision_polygon.polygon = Geometry2DUtil.largest_contour(
+				_collidable_contours([polygon_points]))
 	if is_instance_valid(collision_object):
 		_update_collision_polygons(_get_collision_polygons(cached_clipped_polygons))
 
@@ -959,17 +1058,100 @@ func _get_fill_and_stroke_polygons(fill_polygons : Array[PackedVector2Array]) ->
 # Any surplus node is kept, but hidden and disabled, so it can be reused when the
 # amount of polygons grows again
 func _update_collision_polygons(collision_polygons : Array[PackedVector2Array]) -> void:
+	var usable := _collidable_contours(collision_polygons)
 	var existing = collision_object.get_children().filter(func(ch): return ch is CollisionPolygon2D)
 	for idx in existing.size():
-		if idx >= collision_polygons.size():
+		if idx >= usable.size():
 			existing[idx].hide()
 			existing[idx].disabled = true
-	for polygon_index in collision_polygons.size():
+			# a stale contour would keep failing convex decomposition on every physics
+			# rebuild - hidden and disabled or not - so the node is parked empty until
+			# it is reused (or pruned before save)
+			existing[idx].polygon = PackedVector2Array()
+	for polygon_index in usable.size():
 		if polygon_index >= existing.size():
 			existing.append(_make_new_collision_polygon_2d())
-		existing[polygon_index].polygon = collision_polygons[polygon_index]
+		existing[polygon_index].polygon = usable[polygon_index]
 		existing[polygon_index].show()
 		existing[polygon_index].disabled = false
+
+
+# Not every contour is worth a CollisionPolygon2D as it arrives:
+#  - one with a vertex repeating the one before it cannot be decomposed into convex
+#    shapes, which Godot reports as `Convex decomposing failed!` on load;
+#  - one that crosses itself cannot either, and the editor cannot triangulate it to
+#    draw it, adding `Invalid polygon data, triangulation failed.` on every redraw -
+#    it is resolved into its simple pieces in stead (see normalize_contour);
+#  - one that touches itself at a repeated vertex - a union pinching two lobes
+#    together - triangulates but does not decompose either, and is split into the
+#    separate loops meeting there (see split_at_pinch_points);
+#  - one enclosing next to no surface collides with nothing and is dropped.
+func _collidable_contours(contours : Array[PackedVector2Array]) -> Array[PackedVector2Array]:
+	var usable : Array[PackedVector2Array] = []
+	for contour in contours:
+		for piece in Geometry2DUtil.normalize_contour(contour):
+			for raw_loop in Geometry2DUtil.split_at_pinch_points(piece):
+				if Geometry2DUtil.get_polygon_area(raw_loop) <= MINIMUM_COLLISION_AREA:
+					continue
+				if Geometry2D.triangulate_polygon(raw_loop).is_empty():
+					# no surface anything can draw or collide with
+					continue
+				_append_collidable(Geometry2DUtil.remove_collinear_points(raw_loop), usable)
+	return usable
+
+
+# Adds a contour to the set the CollisionPolygon2D nodes are built from, in the form
+# the editor can actually draw.
+#
+# The editor renders a collider by convex-decomposing it and filling each piece, and a
+# thin enough contour makes the partitioner emit a piece with no surface: the
+# decomposition reports success, the fill of that one piece fails, and the log fills up
+# with `Invalid polygon data, triangulation failed.` - once per redraw, forever. Some
+# contours cannot be trimmed out of that state without moving the outline.
+#
+# For those the decomposition itself becomes the collider: one node per convex piece,
+# minus the pieces with no surface. Convex pieces need no decomposing, so nothing is
+# left to fail, and dropping an empty piece costs no collision area. It buys a handful
+# of extra nodes for the few contours that need it.
+func _append_collidable(loop : PackedVector2Array, usable : Array[PackedVector2Array]) -> void:
+	# whatever comes back here is what gets checked AND what gets handed on: validating
+	# one contour and then storing another is how a piece the editor cannot fill slips
+	# through a gate that just said the geometry was fine
+	var subject := loop
+	var pieces := Geometry2D.decompose_polygon_in_convex(subject)
+	if pieces.is_empty():
+		# the partitioner refused it outright, which it does for shapes the silent test
+		# above cannot always predict. Clipper rebuilding the outline usually settles
+		# whatever it objected to; if it does not, the geometry is handed on as it is,
+		# because a collider that logs is a smaller problem than a missing one
+		for rebuilt in Geometry2DUtil.normalize_contour(subject):
+			var retry := Geometry2D.decompose_polygon_in_convex(rebuilt)
+			if not retry.is_empty():
+				subject = rebuilt
+				pieces = retry
+				break
+		if pieces.is_empty():
+			usable.append(subject)
+			return
+	var degenerate := false
+	for piece in pieces:
+		if Geometry2D.triangulate_polygon(piece).is_empty():
+			degenerate = true
+			break
+	if not degenerate:
+		usable.append(subject)
+		return
+	# every piece that draws is kept, however small. They are what the surface is made
+	# of, and the ones left out have no surface to lose - filtering these by area is how
+	# a contour ends up with nothing salvaged and the bad geometry handed on anyway.
+	var salvaged := false
+	for piece in pieces:
+		if Geometry2D.triangulate_polygon(piece).is_empty():
+			continue
+		usable.append(piece)
+		salvaged = true
+	if not salvaged:
+		usable.append(subject)
 
 
 func _make_new_collision_polygon_2d() -> CollisionPolygon2D:

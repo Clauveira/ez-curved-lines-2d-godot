@@ -9,9 +9,14 @@ const THRESHOLD = 0.1
 ## same edge through a different chain of floating point operations - a stroke extruded
 ## up against the contour of its fill, for instance - subtracting one from the other
 ## leaves slivers behind, which are not holes: slicing the result around them would
-## only fragment it. Measured slivers stay below 0.00001, a cutout of 1 pixel across
-## still covers ~3.
-const MINIMUM_HOLE_AREA = 0.1
+## only fragment it. A cutout of 1 pixel across still covers ~3.
+## [br][br]
+## The figure has to be a whole pixel rather than the fraction it was, because every
+## hole costs a cut through the whole shape and the cuts compound. An outward stroke
+## meeting its fill leaves gaps of half a pixel and up - well clear of the sliver scale
+## this was first measured at - and preserving those voids fragmented one shape into
+## twenty-two colliders where three would do.
+const MINIMUM_HOLE_AREA = 1.0
 
 static func get_polygon_bounding_rect(points : PackedVector2Array) -> Rect2:
 	var minx := INF
@@ -40,21 +45,186 @@ static func get_polygon_area(points : PackedVector2Array) -> float:
 	return absf(double_area) * 0.5
 
 
-static func slice_polygon_vertical(polygon : PackedVector2Array, slice_target : Vector2) -> Array[PackedVector2Array]:
+## Removes every vertex coinciding with the one before it, the closing vertex included.
+## The boolean operations of [Geometry2D] hand back contours in which the same point
+## occurs twice in a row - a corner where two clipped edges meet, most often. That is
+## the same shape geometrically, but Godot cannot triangulate it: a [CollisionPolygon2D]
+## carrying such a contour makes `decompose_polygon_in_convex()` bail out with
+## `Convex decomposing failed!` every time the scene loads and every time the shape is
+## recomputed, even when the node is hidden and disabled.
+static func remove_duplicate_points(points : PackedVector2Array) -> PackedVector2Array:
+	var result : PackedVector2Array = []
+	for p : Vector2 in points:
+		if result.is_empty() or not result[-1].is_equal_approx(p):
+			result.append(p)
+	while result.size() > 1 and result[0].is_equal_approx(result[-1]):
+		result.remove_at(result.size() - 1)
+	return result
+
+
+## Returns the simple polygon(s) covering the surface enclosed by [param points].
+## A contour that crosses itself - a shape dragged through itself, a clip path folded
+## over its own outline - cannot be triangulated, so neither [Polygon2D] nor
+## [CollisionPolygon2D] can digest it: the editor logs
+## `Invalid polygon data, triangulation failed.` on every redraw and the collider
+## `Convex decomposing failed!` on every rebuild, for as long as the contour stays.
+## Merging such a contour with itself resolves the crossings into one simple outline
+## per enclosed lobe. A contour that is already simple comes back alone, deduplicated;
+## one enclosing no surface at all comes back as nothing.
+static func normalize_contour(points : PackedVector2Array) -> Array[PackedVector2Array]:
+	var cleaned := remove_duplicate_points(points)
+	if cleaned.size() < 3:
+		return []
+	if not Geometry2D.triangulate_polygon(cleaned).is_empty():
+		return [cleaned]
+	var pieces : Array[PackedVector2Array] = []
+	for piece in Geometry2D.merge_polygons(cleaned, cleaned):
+		if Geometry2D.is_polygon_clockwise(piece):
+			continue
+		# the merge can hand a weakly simple contour straight back - lobes pinched
+		# together at a repeated vertex - which not even ear clipping digests reliably,
+		# and it strings vertices along wherever it ran down a straight edge
+		for loop in split_at_pinch_points(remove_duplicate_points(piece)):
+			if loop.size() > 2 and not Geometry2D.triangulate_polygon(loop).is_empty():
+				pieces.append(loop)
+	# what is left after this are sub-pixel artefacts of the merge itself - Clipper
+	# works on scaled integers and can return a micro-crossing unchanged - and nothing
+	# that draws or collides can digest those: they are dropped, not handed on
+	return pieces
+
+
+## Removes every vertex lying exactly on the straight edge between its two neighbours,
+## which a boolean operation emits wherever it ran along one. The convex partition of a
+## [CollisionPolygon2D] can turn such a vertex into a piece with no surface, and the
+## editor reports that as `Invalid polygon data, triangulation failed.` on every redraw.
+## [br][br]
+## Keep the tolerance far below the curvature of a tessellated outline, whose points sit
+## a thousandth of a pixel off the chord between their neighbours by nature: at 0.01 a
+## 198 point outline collapses to 12 and loses half its surface.
+static func remove_collinear_points(points : PackedVector2Array, tolerance := 0.000001) -> PackedVector2Array:
+	if points.size() < 4:
+		return points
+	var result : PackedVector2Array = []
+	for i in points.size():
+		var previous := points[(i - 1 + points.size()) % points.size()]
+		var next := points[(i + 1) % points.size()]
+		var on_edge := Geometry2D.get_closest_point_to_segment(points[i], previous, next)
+		if on_edge.distance_to(points[i]) >= tolerance:
+			result.append(points[i])
+	return result if result.size() > 2 else points
+
+
+## Splits a contour that touches itself at a repeated - but not consecutive - vertex
+## into the separate loops meeting there, recursively. Clipper hands back such "weakly
+## simple" contours whenever a union pinches two lobes together at a point: the
+## ear-clipping triangulator accepts them, but the convex partitioner that builds a
+## [CollisionPolygon2D]'s shapes does not, and reports `Convex decomposing failed!` on
+## every physics rebuild. Each loop keeps one copy of the shared vertex, so together
+## they cover exactly the surface of the original.
+static func split_at_pinch_points(points : PackedVector2Array) -> Array[PackedVector2Array]:
+	for i in points.size():
+		for j in range(i + 1, points.size()):
+			if points[i].is_equal_approx(points[j]):
+				var inner := points.slice(i, j)
+				var outer := points.slice(j) + points.slice(0, i)
+				return split_at_pinch_points(inner) + split_at_pinch_points(outer)
+	return [points]
+
+
+## [method normalize_contour] applied to a whole set: the pieces of every contour, flat.
+static func normalize_contours(polygons : Array[PackedVector2Array]) -> Array[PackedVector2Array]:
+	var result : Array[PackedVector2Array] = []
+	for points in polygons:
+		result.append_array(normalize_contour(points))
+	return result
+
+
+## The contour of [param polygons] covering the largest surface; empty when none does.
+static func largest_contour(polygons : Array[PackedVector2Array]) -> PackedVector2Array:
+	var best : PackedVector2Array = []
+	var best_area := 0.0
+	for points in polygons:
+		var area := get_polygon_area(points)
+		if area > best_area:
+			best_area = area
+			best = points
+	return best
+
+
+static func slice_polygon_through(polygon : PackedVector2Array, slice_target : Vector2) -> Array[PackedVector2Array]:
 	var box := get_polygon_bounding_rect(polygon).grow(1.0)
 	if not box.has_point(slice_target):
 		return [polygon]
-	return Geometry2D.intersect_polygons([
-		box.position,
-		Vector2(slice_target.x, box.position.y),
-		Vector2(slice_target.x, box.position.y + box.size.y),
-		Vector2(box.position.x, box.position.y + box.size.y),
-	], polygon) + Geometry2D.intersect_polygons([
-		Vector2(slice_target.x, box.position.y),
-		Vector2(box.position.x + box.size.x, box.position.y),
-		box.position + box.size,
-		Vector2(slice_target.x, box.position.y + box.size.y),
-	], polygon)
+	# The cut is always vertical. Choosing the axis by the bounding box - halving a tall
+	# shape horizontally rather than leaving two splinters - reads like the obvious
+	# improvement and is what a terrain cutter this was compared against does, but it
+	# was measured to make things worse here: a horizontal cut through a stroke union
+	# produces contours the convex partitioner refuses outright, which a vertical cut
+	# through the same shape does not. The shapes are not terrain pieces, and the
+	# intuition does not carry over.
+	var vertical := true
+	var cut : float = slice_target.x if vertical else slice_target.y
+	var first : PackedVector2Array
+	var second : PackedVector2Array
+	if vertical:
+		first = PackedVector2Array([
+			box.position,
+			Vector2(cut, box.position.y),
+			Vector2(cut, box.end.y),
+			Vector2(box.position.x, box.end.y)])
+		second = PackedVector2Array([
+			Vector2(cut, box.position.y),
+			Vector2(box.end.x, box.position.y),
+			box.end,
+			Vector2(cut, box.end.y)])
+	else:
+		first = PackedVector2Array([
+			box.position,
+			Vector2(box.end.x, box.position.y),
+			Vector2(box.end.x, cut),
+			Vector2(box.position.x, cut)])
+		second = PackedVector2Array([
+			Vector2(box.position.x, cut),
+			Vector2(box.end.x, cut),
+			box.end,
+			Vector2(box.position.x, box.end.y)])
+	var halves := Geometry2D.intersect_polygons(first, polygon) 			+ Geometry2D.intersect_polygons(second, polygon)
+	var cleaned : Array[PackedVector2Array] = []
+	for half in halves:
+		cleaned.append(_drop_vertices_along_cut(half, cut, vertical))
+	return cleaned
+
+
+## Drops the vertices Clipper leaves strung along a straight cut. Where the cutting
+## rectangle of [method slice_polygon_through] runs through the polygon, the result
+## carries a vertex for every edge it crossed, all of them on the same x and all but
+## the two ends redundant. They describe no shape - the run between them is one
+## straight segment - but the convex partition of a [CollisionPolygon2D] can emit a
+## zero-area piece at each, which decomposes without complaint and then cannot be
+## drawn, so the editor reports `Invalid polygon data, triangulation failed.` on every
+## redraw for as long as the collider exists.
+## [br][br]
+## Only vertices whose neighbours share the cut are dropped, so the outline itself -
+## whose points sit off the chord between their neighbours by thousandths of a pixel
+## and are indistinguishable from an artefact by distance alone - is never touched.
+static func _drop_vertices_along_cut(polygon : PackedVector2Array, cut : float,
+			vertical : bool) -> PackedVector2Array:
+	if polygon.size() < 4:
+		return polygon
+	var on_cut : Callable = func(p : Vector2) -> bool:
+		return is_equal_approx(p.x if vertical else p.y, cut)
+	var result : PackedVector2Array = []
+	for i in polygon.size():
+		var point := polygon[i]
+		if not on_cut.call(point):
+			result.append(point)
+			continue
+		var previous := polygon[(i - 1 + polygon.size()) % polygon.size()]
+		var next := polygon[(i + 1) % polygon.size()]
+		if on_cut.call(previous) and on_cut.call(next):
+			continue
+		result.append(point)
+	return result if result.size() > 2 else polygon
 
 
 static func apply_polygon_bool_operation_in_place(
@@ -97,21 +267,25 @@ static func apply_clips_to_polygon(
 
 
 static func slice_polygons_with_holes(current_polygons : Array[PackedVector2Array], holes : Array[PackedVector2Array]) -> void:
-	var result_polygons : Array[PackedVector2Array] = []
 	for hole in holes:
+		var result_polygons : Array[PackedVector2Array] = []
+		var hole_box := get_polygon_bounding_rect(hole)
 		for current_points : PackedVector2Array in current_polygons:
-			var slices := slice_polygon_vertical(
-				current_points, get_polygon_center(hole)
-			)
+			# A hole lies inside exactly one of the pieces, and cutting the others in
+			# half achieves nothing except doubling their number. Left as it was, one
+			# cut per hole per piece makes the count grow with 2^holes: a shape with a
+			# stroke wide enough to trap five voids came out as twenty-two colliders
+			# where five would do.
+			if not hole_box.intersects(get_polygon_bounding_rect(current_points)) 					or Geometry2D.intersect_polygons(hole, current_points).is_empty():
+				result_polygons.append(current_points)
+				continue
+			var slices := slice_polygon_through(current_points, get_polygon_center(hole))
 			for slice in slices:
-				var result = Geometry2D.clip_polygons(slice, hole)
-				for poly_points in result:
+				for poly_points in Geometry2D.clip_polygons(slice, hole):
 					if not Geometry2D.is_polygon_clockwise(poly_points):
 						result_polygons.append(poly_points)
 		current_polygons.clear()
 		current_polygons.append_array(result_polygons)
-		result_polygons.clear()
-
 
 
 ## Returns the smallest set of non-overlapping polygons covering exactly the same
@@ -193,8 +367,13 @@ static func _merge_until_stable(solids : Array[PackedVector2Array]) -> bool:
 # up into several polygons. Subtracting the overlapping ones first usually shrinks the
 # remainder far enough for the postponed ones to overlap it as well, so it can stay in
 # one piece. What is still enclosed once nothing else is left really is an island.
+# With [param slice_around_islands] flagged off the remainder is left whole and the
+# islands are returned alongside it, so both stay closed loops: a caller after the
+# _contours_ of the remainder needs them intact, a caller after its _surface_ needs it
+# sliced, because a [CollisionPolygon2D] cannot represent a hole.
 static func _subtract_polygons(minuend : PackedVector2Array,
-			subtrahends : Array[PackedVector2Array]) -> Array[PackedVector2Array]:
+			subtrahends : Array[PackedVector2Array],
+			slice_around_islands := true) -> Array[PackedVector2Array]:
 	var remainder : Array[PackedVector2Array] = [minuend]
 	var todo := subtrahends.duplicate()
 	while not todo.is_empty() and not remainder.is_empty():
@@ -213,6 +392,10 @@ static func _subtract_polygons(minuend : PackedVector2Array,
 			else:
 				remainder = difference
 		if postponed.size() == todo.size():
+			if not slice_around_islands:
+				# only islands are left: each of them bounds the remainder just like the
+				# remainder bounds them, so they are contours of it in their own right
+				return remainder + postponed
 			# only enclosed polygons are left: slice the remainder around them, in
 			# stead of leaving it with a hole it cannot represent
 			slice_polygons_with_holes(remainder, postponed)
@@ -221,48 +404,42 @@ static func _subtract_polygons(minuend : PackedVector2Array,
 	return remainder
 
 
-static func calculate_outlines(result : Array[PackedVector2Array]) -> Array[PackedVector2Array]:
-	if result.size() <= 1:
-		return result
-	var succesful_merges := true
-	var guard = 0
-	var holes : Array[PackedVector2Array] = []
-	while succesful_merges and result.size() > 1 and guard < 1000:
-		succesful_merges = false
-		guard += 1
-		var indices_to_be_removed : Dictionary[int, bool] = {}
-		var merged_to_be_appended : Array[PackedVector2Array] = []
+## Returns the contours enclosing the area covered by [param polygons]: the outline of
+## every solid they merge into first, followed by the holes those outlines enclose.
+## [ScalableVectorShape2D] draws one [Line2D] along each of them, so its stroke follows
+## the contour of a cutout just like it follows the contour of the shape itself.
+## The holes are derived from the merged outlines only once the whole set is joined,
+## because an area with a hole in it arrives here already sliced open around that hole -
+## see [method slice_polygons_with_holes]. Reading a hole off the merge of a _pair_ in
+## stead reports the hole of that pair: whatever the polygons merged after it fill up
+## of that hole is then still reported as a hole which is not there anymore.
+static func calculate_outlines(polygons : Array[PackedVector2Array]) -> Array[PackedVector2Array]:
+	if polygons.size() <= 1:
+		return polygons
 
-		for current_poly_idx in result.size():
-			if current_poly_idx in indices_to_be_removed:
+	var sources := polygons.duplicate()
+	_merge_until_stable(polygons)
+
+	var holes : Array[PackedVector2Array] = []
+	for solid in polygons:
+		for hole in _subtract_polygons(solid, sources, false):
+			if get_polygon_area(hole) <= MINIMUM_HOLE_AREA:
 				continue
-			for other_poly_idx in result.size():
-				if current_poly_idx == other_poly_idx or other_poly_idx in indices_to_be_removed:
-					continue
-				var merge_result := Geometry2D.merge_polygons(
-						result[current_poly_idx], result[other_poly_idx])
-				var regular := merge_result.filter(func(x): return not Geometry2D.is_polygon_clockwise(x))
-				var clockwise := merge_result.filter(Geometry2D.is_polygon_clockwise)
-				if regular.size() == 1:
-					succesful_merges = true
-					indices_to_be_removed[current_poly_idx] = true
-					indices_to_be_removed[other_poly_idx] = true
-					merged_to_be_appended.append(regular[0])
-					holes.append_array(clockwise)
-		var sorted_indices = indices_to_be_removed.keys()
-		sorted_indices.sort()
-		sorted_indices.reverse()
-		for idx in sorted_indices:
-			result.remove_at(idx)
-		result.append_array(merged_to_be_appended)
-	return result + holes
+			if not Geometry2D.is_polygon_clockwise(hole):
+				# a hole runs against the winding order of the outline enclosing it
+				hole.reverse()
+			holes.append(hole)
+	return polygons + holes
 
 
 static func calculate_polystroke(outline : PackedVector2Array, stroke_width : float,
-			end_mode : Geometry2D.PolyEndType, joint_mode : Geometry2D.PolyJoinType) -> Array[PackedVector2Array]:
+			end_mode : Geometry2D.PolyEndType, joint_mode : Geometry2D.PolyJoinType,
+			offset_poly : float) -> Array[PackedVector2Array]:
 	if outline.is_empty():
 		return []
-	var poly_strokes := Geometry2D.offset_polyline(outline, stroke_width, joint_mode, end_mode)
+	var offset_result := Geometry2D.offset_polygon(outline, offset_poly, joint_mode) if not is_zero_approx(offset_poly) else ([] as Array[PackedVector2Array])
+	var offsetted_outline := outline if offset_result.is_empty() else offset_result[0]
+	var poly_strokes := Geometry2D.offset_polyline(offsetted_outline, stroke_width, joint_mode, end_mode)
 	var result_poly_strokes := Array(poly_strokes.filter(func(ps): return not Geometry2D.is_polygon_clockwise(ps)), TYPE_PACKED_VECTOR2_ARRAY, "", null)
 	var result_poly_holes := Array(poly_strokes.filter(Geometry2D.is_polygon_clockwise), TYPE_PACKED_VECTOR2_ARRAY, "", null)
 	if not result_poly_holes.is_empty():
